@@ -1,0 +1,6 @@
+packages
+chromium
+libnss3
+libnspr4
+libasound2
+libgbm1
