@@ -8,7 +8,7 @@ from playwright.sync_api import sync_playwright
 from fake_useragent import UserAgent
 
 def clean_price(price_str):
-    if not price_str:
+    if not price_str or price_str == "N/A":
         return "N/A"
     
     # If it's a status message (letters only) or error, return it as is
@@ -17,7 +17,8 @@ def clean_price(price_str):
 
     # Clean up R currency, commas, etc
     clean = re.sub(r'[^\d.,]', '', str(price_str))
-    return clean.strip()
+    res = clean.strip()
+    return res if res else "N/A"
 
 def extract_price_from_text(text):
     """Fallback: Search for R xxx.xx patterns in text"""
@@ -377,40 +378,62 @@ def scrape_products_batch(urls, progress_callback=None):
                                         break
                                 if html_price:
                                     break
+
+                    # Fallback: Direct search for a-price-whole if all else failed
+                    if not html_price:
+                        whole = page.locator('.a-price-whole').first
+                        fraction = page.locator('.a-price-fraction').first
+                        if whole.count() > 0:
+                            w_txt = whole.text_content().strip()
+                            f_txt = fraction.text_content().strip() if fraction.count() > 0 else "00"
+                            html_price = f"R {w_txt}.{f_txt}"
                     
                     if html_price:
                         result["RSP"] = html_price
 
                     # Original Price (List Price / Was Price)
                     if result["Original Price"] == "N/A":
-                        # We search specifically for the "basisPrice" or "a-text-price" often found in the core display
-                        op_selectors = [
-                            '#corePriceDisplay_desktop_feature_div .a-text-price .a-offscreen',
-                            '#corePrice_desktop .a-text-price .a-offscreen',
-                            '.basisPrice .a-offscreen',
-                            'span[data-a-strike="true"]',
-                            '.a-price.a-text-price .a-offscreen'
-                        ]
-                        for sel in op_selectors:
-                             if page.locator(sel).count() > 0:
-                                candidates = page.locator(sel).all()
-                                for c in candidates:
-                                    # Check visibility of parent wrapper usually
-                                    parent = c.locator('..')
-                                    # We don't strict check parent visibility here as it sometimes fails for strike-throughs
-                                    # but we DO check if the value is different from RSP
-                                    
-                                    txt = c.text_content().strip()
-                                    if txt and 'R' in txt:
-                                        cleaned_op = clean_price(txt)
-                                        cleaned_rsp = clean_price(result["RSP"])
-                                        
-                                        # Strict check: Must be different from RSP and valid
-                                        if cleaned_op and cleaned_rsp and cleaned_op != cleaned_rsp:
-                                            result["Original Price"] = txt
-                                            break
-                                if result["Original Price"] != "N/A":
-                                    break
+                        # Strategy 1: Look for "List Price:" label explicitly (User Request)
+                        try:
+                            list_price_label = page.get_by_text("List Price:", exact=False).first
+                            if list_price_label.count() > 0:
+                                # Look in parent context
+                                parent = list_price_label.locator('..')
+                                # Try to find the price element .a-text-price
+                                price_el = parent.locator('.a-text-price .a-offscreen').first
+                                if price_el.count() > 0:
+                                    result["Original Price"] = price_el.text_content().strip()
+                                else:
+                                    # Try to extract R xxx from text
+                                    parent_text = parent.inner_text()
+                                    match = re.search(r'List Price:\s*(R\s?[\d,.\s]+)', parent_text, re.IGNORECASE)
+                                    if match:
+                                        result["Original Price"] = match.group(1).strip()
+                        except: pass
+
+                        # Strategy 2: Standard selectors
+                        if result["Original Price"] == "N/A":
+                            op_selectors = [
+                                '#corePriceDisplay_desktop_feature_div .a-text-price .a-offscreen',
+                                '#corePrice_desktop .a-text-price .a-offscreen',
+                                '.basisPrice .a-offscreen',
+                                'span[data-a-strike="true"]',
+                                '.a-price.a-text-price .a-offscreen'
+                            ]
+                            for sel in op_selectors:
+                                 if page.locator(sel).count() > 0:
+                                    candidates = page.locator(sel).all()
+                                    for c in candidates:
+                                        txt = c.text_content().strip()
+                                        if txt and 'R' in txt:
+                                            cleaned_op = clean_price(txt)
+                                            cleaned_rsp = clean_price(result["RSP"])
+                                            
+                                            if cleaned_op and cleaned_rsp and cleaned_op != cleaned_rsp:
+                                                result["Original Price"] = txt
+                                                break
+                                    if result["Original Price"] != "N/A":
+                                        break
 
                     # Seller
                     if result["Seller"] == "N/A":
@@ -542,20 +565,64 @@ def scrape_products_batch(urls, progress_callback=None):
                     # FORCE CHECK HTML to match user visual expectation (overwriting JSON if found)
                     html_original_price = None
                     
-                    # Selectors for the crossed-out list price (Relative to search_scope)
-                    op_selectors = ['.buy-box-old-price', '[data-ref="buy-box-list-price"]', '.list-price', 'div[class*="list-price"]']
-                    for sel in op_selectors:
-                        if search_scope.locator(sel).count() > 0:
-                            # Use inner_text() to avoid hidden metadata
-                            raw_text = search_scope.locator(sel).first.inner_text().strip()
-                            
-                            # Clean potential duplication (e.g. "R 4,9994999") by extracting the first valid price pattern
-                            match = re.search(r'R\s?[\d,.]+', raw_text)
-                            if match:
-                                html_original_price = match.group(0)
+                    # Strategy 1: User Reported Structure (Specific Buybox Class)
+                    # User provided: <span class="buybox-offer-module_list-price_..."><span class="currency...">R 2,199</span>...</span>
+                    try:
+                        # This class is specific to the main buybox list price
+                        # Use 'page' instead of 'search_scope' because Buybox is often in a sidebar (aside) not main panel
+                        list_price_container = page.locator('span[class*="buybox-offer-module_list-price"]').first
+                        if list_price_container.count() > 0:
+                            # Try nested currency span first
+                            curr = list_price_container.locator('span[class*="currency"]').first
+                            if curr.count() > 0:
+                                html_original_price = curr.text_content().strip()
                             else:
-                                html_original_price = raw_text
-                            break
+                                html_original_price = list_price_container.text_content().strip()
+                    except: pass
+
+                    if not html_original_price:
+                        # Strategy 2: Adjacent 'currency plus' spans (Legacy/Fallback)
+                        try:
+                            # Find all spans with both classes (Takealot specific styling)
+                            currency_elements = search_scope.locator('span[class*="currency"][class*="plus"]').all()
+                            valid_prices = []
+                            for el in currency_elements:
+                                txt = el.text_content().strip()
+                                if 'R' in txt: valid_prices.append(txt)
+                            
+                            # If we found at least 2, and the current RSP is likely one of them
+                            if len(valid_prices) >= 2:
+                                p1 = valid_prices[0]
+                                p2 = valid_prices[1]
+                                
+                                # Heuristic: If we haven't found RSP yet, assume first is RSP
+                                if result["RSP"] == "N/A":
+                                    result["RSP"] = p1
+                                
+                                # Identify Original: It should be different from RSP
+                                curr_clean = clean_price(result["RSP"])
+                                
+                                if clean_price(p1) != curr_clean:
+                                    html_original_price = p1
+                                elif clean_price(p2) != curr_clean:
+                                    html_original_price = p2
+                        except: pass
+
+                    if not html_original_price:
+                        # Strategy 3: Standard Selectors for the crossed-out list price (Relative to search_scope)
+                        op_selectors = ['.buy-box-old-price', '[data-ref="buy-box-list-price"]', '.list-price', 'div[class*="list-price"]']
+                        for sel in op_selectors:
+                            if search_scope.locator(sel).count() > 0:
+                                # Use inner_text() to avoid hidden metadata
+                                raw_text = search_scope.locator(sel).first.inner_text().strip()
+                                
+                                # Clean potential duplication (e.g. "R 4,9994999") by extracting the first valid price pattern
+                                match = re.search(r'R\s?[\d,.]+', raw_text)
+                                if match:
+                                    html_original_price = match.group(0)
+                                else:
+                                    html_original_price = raw_text
+                                break
                     
                     # Fallback text search if selector fails (e.g., "List price is R 4,999")
                     # CRITICAL: Only search inside the product container to avoid Related Products
