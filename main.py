@@ -68,18 +68,29 @@ class PriceCheckerApp:
             total_urls = len(df)
             self.progress["maximum"] = total_urls
             
-            prices = []
+            results_list = []
             
             for index, row in df.iterrows():
                 url = row['URL']
                 self.root.after(0, lambda u=url: self.lbl_status.config(text=f"Checking: {u[:30]}..."))
                 
-                price = scraper.get_price(url)
-                prices.append(price)
+                # Call new scraper function which returns a dict
+                data = scraper.scrape_product(url)
+                results_list.append(data)
                 
                 self.root.after(0, self.progress.step, 1)
                 
-            df['Fetched Price'] = prices
+            # Convert results to DataFrame
+            results_df = pd.DataFrame(results_list)
+            
+            # Update original dataframe with new columns
+            for col in results_df.columns:
+                df[col] = results_df[col].values
+
+            # Remove requested columns that are no longer needed
+            cols_to_remove = ["1★", "2★", "3★", "4★", "5★"]
+            df.drop(columns=[c for c in cols_to_remove if c in df.columns], inplace=True)
+
             df['Last Checked'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             
             # Save to new file
